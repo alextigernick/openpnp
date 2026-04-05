@@ -79,6 +79,7 @@ import org.openpnp.gui.JobPanel.OpenRecentJobAction;
 import org.openpnp.gui.components.AutoSelectTextTable;
 import org.openpnp.gui.components.ExistingBoardOrPanelDialog;
 import org.openpnp.gui.processes.MultiPlacementBoardLocationProcess;
+import org.openpnp.gui.processes.PasteDispenseProcess;
 import org.openpnp.gui.support.ActionGroup;
 import org.openpnp.gui.support.CustomBooleanRenderer;
 import org.openpnp.gui.support.MonospacedFontTableCellRenderer;
@@ -176,22 +177,22 @@ public class JobPanel extends JPanel {
         singleSelectionActionGroup =
                 new ActionGroup(captureToolBoardLocationAction, moveCameraToBoardLocationAction,
                         moveCameraToBoardLocationNextAction, moveToolToBoardLocationAction,
-                        twoPointLocateBoardLocationAction, fiducialCheckAction,
+                        twoPointLocateBoardLocationAction, fiducialCheckAction, pasteDispenseAction,
                         setEnabledAction, setCheckFidsAction, setSideAction);
         singleSelectionActionGroup.setEnabled(false);
         
-        multiSelectionActionGroup = new ActionGroup(captureToolBoardLocationAction, setEnabledAction, 
+        multiSelectionActionGroup = new ActionGroup(captureToolBoardLocationAction, pasteDispenseAction, setEnabledAction, 
                 setCheckFidsAction, setSideAction);
         multiSelectionActionGroup.setEnabled(false);
         
         singleTopLevelSelectionActionGroup = new ActionGroup(captureToolBoardLocationAction, removeBoardAction, captureCameraBoardLocationAction,
                 moveCameraToBoardLocationAction,
                 moveCameraToBoardLocationNextAction, moveToolToBoardLocationAction,
-                twoPointLocateBoardLocationAction, fiducialCheckAction,
+                twoPointLocateBoardLocationAction, fiducialCheckAction, pasteDispenseAction,
                 setEnabledAction, setCheckFidsAction, setSideAction);
         singleTopLevelSelectionActionGroup.setEnabled(false);
         
-        multiTopLevelSelectionActionGroup = new ActionGroup(captureToolBoardLocationAction, removeBoardAction, setEnabledAction, 
+        multiTopLevelSelectionActionGroup = new ActionGroup(captureToolBoardLocationAction, removeBoardAction, pasteDispenseAction, setEnabledAction, 
                 setCheckFidsAction, setSideAction);
         multiTopLevelSelectionActionGroup.setEnabled(false);
         
@@ -443,6 +444,10 @@ public class JobPanel extends JPanel {
         JButton btnFiducialCheck = new JButton(fiducialCheckAction);
         toolBarBoards.add(btnFiducialCheck);
         btnFiducialCheck.setHideActionText(true);
+
+        JButton btnPasteDispense = new JButton(pasteDispenseAction);
+        toolBarBoards.add(btnPasteDispense);
+        btnPasteDispense.setHideActionText(true);
         
         toolBarBoards.addSeparator();
         
@@ -1545,6 +1550,22 @@ public class JobPanel extends JPanel {
                 MovableUtils.fireTargetedUserAction(camera);
                 
                 Helpers.selectObjectTableRow(jobTable, placementsHolderLocation);
+            });
+        }
+    };
+
+    public final Action pasteDispenseAction = new AbstractAction() {
+        {
+            putValue(SMALL_ICON, Icons.paste);
+            putValue(NAME, "Dispense Paste");
+            putValue(SHORT_DESCRIPTION,
+                    "Run fiducial location and dispense solder paste on the selected board or panel.");
+        }
+
+        @Override
+        public void actionPerformed(ActionEvent arg0) {
+            UiUtils.messageBoxOnException(() -> {
+                new PasteDispenseProcess(mainFrame, JobPanel.this);
             });
         }
     };

@@ -153,12 +153,7 @@ public class BoardPlacementsPanel extends JPanel {
                     throw new Error(e);
                 }
                 
-                //For now, skip the solder paste importer
                 Logger.trace(boardImporter.getClass().getSimpleName());
-                if (boardImporter.getClass() == SolderPasteGerberImporter.class) {
-                    continue;
-                }
-                
                 boardImporters.add(boardImporter);
             }
         }

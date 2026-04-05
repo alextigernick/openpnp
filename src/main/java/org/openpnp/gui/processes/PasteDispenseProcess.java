@@ -3,6 +3,7 @@ package org.openpnp.gui.processes;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.awt.Shape;
 import java.awt.geom.Rectangle2D;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -55,13 +56,7 @@ public class PasteDispenseProcess {
         public boolean runFiducialCheck = true;
         public double dispenseZOffsetMm = 0.0;
         public int postDispenseDwellMs = 0;
-        public double smallMaxAreaMm2 = 0.5;
-        public double mediumMaxAreaMm2 = 1.5;
-        public double largeMaxAreaMm2 = 4.0;
-        public String smallProfile = "";
-        public String mediumProfile = "";
-        public String largeProfile = "";
-        public String extraLargeProfile = "";
+        public double dotAreaMm2 = 0.5;
     }
 
     private static class PastePadTarget {
@@ -69,15 +64,17 @@ public class PasteDispenseProcess {
         private final BoardPad pad;
         private final Location location;
         private final double areaMm2;
-        private final String profile;
+        private final int dotNumber;
+        private final int dotCount;
 
         private PastePadTarget(BoardLocation boardLocation, BoardPad pad, Location location,
-                double areaMm2, String profile) {
+                double areaMm2, int dotNumber, int dotCount) {
             this.boardLocation = boardLocation;
             this.pad = pad;
             this.location = location;
             this.areaMm2 = areaMm2;
-            this.profile = profile;
+            this.dotNumber = dotNumber;
+            this.dotCount = dotCount;
         }
 
         private String getDisplayName() {
@@ -123,7 +120,8 @@ public class PasteDispenseProcess {
                 super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
                 if (value instanceof Actuator) {
                     Actuator actuator = (Actuator) value;
-                    String scope = actuator.getHead() == null ? "Machine" : actuator.getHead().getName();
+                    String scope =
+                            actuator.getHead() == null ? "Machine" : actuator.getHead().getName();
                     setText(actuator.getName() + " (" + scope + ")");
                 }
                 return this;
@@ -142,27 +140,8 @@ public class PasteDispenseProcess {
                 String.format(Locale.US, "%.3f", properties.dispenseZOffsetMm), 10);
         JTextField dwellField =
                 new JTextField(Integer.toString(properties.postDispenseDwellMs), 10);
-        JTextField smallAreaField = new JTextField(
-                String.format(Locale.US, "%.3f", properties.smallMaxAreaMm2), 10);
-        JTextField mediumAreaField = new JTextField(
-                String.format(Locale.US, "%.3f", properties.mediumMaxAreaMm2), 10);
-        JTextField largeAreaField = new JTextField(
-                String.format(Locale.US, "%.3f", properties.largeMaxAreaMm2), 10);
-
-        JComboBox<String> smallProfileBox = createEditableProfileBox();
-        JComboBox<String> mediumProfileBox = createEditableProfileBox();
-        JComboBox<String> largeProfileBox = createEditableProfileBox();
-        JComboBox<String> extraLargeProfileBox = createEditableProfileBox();
-
-        Runnable refreshProfiles = () -> {
-            Actuator actuator = (Actuator) actuatorBox.getSelectedItem();
-            updateProfileChoices(smallProfileBox, actuator, properties.smallProfile);
-            updateProfileChoices(mediumProfileBox, actuator, properties.mediumProfile);
-            updateProfileChoices(largeProfileBox, actuator, properties.largeProfile);
-            updateProfileChoices(extraLargeProfileBox, actuator, properties.extraLargeProfile);
-        };
-        actuatorBox.addActionListener(event -> refreshProfiles.run());
-        refreshProfiles.run();
+        JTextField dotAreaField =
+                new JTextField(String.format(Locale.US, "%.3f", properties.dotAreaMm2), 10);
 
         JPanel panel = new JPanel(new GridBagLayout());
         int row = 0;
@@ -170,13 +149,7 @@ public class PasteDispenseProcess {
         addField(panel, row++, "Run fiducial check first", fiducialCheckBox);
         addField(panel, row++, "Dispense Z offset (mm)", zOffsetField);
         addField(panel, row++, "Post-dispense dwell (ms)", dwellField);
-        addField(panel, row++, "Small max area (mm^2)", smallAreaField);
-        addField(panel, row++, "Small profile", smallProfileBox);
-        addField(panel, row++, "Medium max area (mm^2)", mediumAreaField);
-        addField(panel, row++, "Medium profile", mediumProfileBox);
-        addField(panel, row++, "Large max area (mm^2)", largeAreaField);
-        addField(panel, row++, "Large profile", largeProfileBox);
-        addField(panel, row++, "Extra-large profile", extraLargeProfileBox);
+        addField(panel, row++, "Dot area per actuation (mm^2)", dotAreaField);
 
         int result = JOptionPane.showConfirmDialog(mainFrame, panel, "Paste Dispense",
                 JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
@@ -196,21 +169,10 @@ public class PasteDispenseProcess {
         if (properties.postDispenseDwellMs < 0) {
             throw new Exception("Post-dispense dwell must be zero or greater.");
         }
-        properties.smallMaxAreaMm2 = parseDouble(smallAreaField.getText(), "small max area");
-        properties.mediumMaxAreaMm2 = parseDouble(mediumAreaField.getText(), "medium max area");
-        properties.largeMaxAreaMm2 = parseDouble(largeAreaField.getText(), "large max area");
-        if (properties.smallMaxAreaMm2 <= 0 || properties.mediumMaxAreaMm2 <= 0
-                || properties.largeMaxAreaMm2 <= 0) {
-            throw new Exception("Area thresholds must be greater than zero.");
+        properties.dotAreaMm2 = parseDouble(dotAreaField.getText(), "dot area per actuation");
+        if (properties.dotAreaMm2 <= 0) {
+            throw new Exception("Dot area per actuation must be greater than zero.");
         }
-        if (!(properties.smallMaxAreaMm2 <= properties.mediumMaxAreaMm2
-                && properties.mediumMaxAreaMm2 <= properties.largeMaxAreaMm2)) {
-            throw new Exception("Area thresholds must be in ascending order.");
-        }
-        properties.smallProfile = getComboValue(smallProfileBox);
-        properties.mediumProfile = getComboValue(mediumProfileBox);
-        properties.largeProfile = getComboValue(largeProfileBox);
-        properties.extraLargeProfile = getComboValue(extraLargeProfileBox);
         machine.setProperty(PROPERTY_NAME, properties);
         return true;
     }
@@ -223,7 +185,7 @@ public class PasteDispenseProcess {
             throw new Exception("Select at least one board or panel in the Job tab.");
         }
 
-        int dispensedPads = 0;
+        int dispensedDots = 0;
         boolean foundAnyPads = false;
         for (PlacementsHolderLocation<?> selectedLocation : selectedLocations) {
             if (!selectedLocation.isEnabled()) {
@@ -235,7 +197,6 @@ public class PasteDispenseProcess {
             }
 
             List<PastePadTarget> targets = collectTargets(selectedLocation);
-            Logger.info("got targets: " + String.format("%d",targets.size()));
             if (targets.isEmpty()) {
                 continue;
             }
@@ -243,14 +204,18 @@ public class PasteDispenseProcess {
 
             optimizeTravel(actuator, targets);
             for (PastePadTarget target : targets) {
-                dispensedPads++;
-                Logger.info("Dispensings for "+String.format("%d",dispensedPads));
+                dispensedDots++;
                 mainFrame.setStatus(String.format(Locale.US,
-                        "Dispensing paste %d: %s on %s with %s (%.3f mm^2)", dispensedPads,
-                        target.getDisplayName(), target.boardLocation.getUniqueId(), target.profile,
-                        target.areaMm2));
+                        "Dispensing paste %d: %s on %s dot %d/%d (%.3f mm^2 pad)", dispensedDots,
+                        target.getDisplayName(), target.boardLocation.getUniqueId(),
+                        target.dotNumber, target.dotCount, target.areaMm2));
                 MovableUtils.moveToLocationAtSafeZ(actuator, target.location);
-                actuator.actuateProfile(target.profile);
+                Logger.info(String.format(Locale.US,
+                        "Dispensing paste %d: %s on %s dot %d/%d (%.3f mm^2 pad)", dispensedDots,
+                        target.getDisplayName(), target.boardLocation.getUniqueId(),
+                        target.dotNumber, target.dotCount, target.areaMm2));
+                actuator.actuate(true);
+                actuator.actuate(false);
                 if (properties.postDispenseDwellMs > 0) {
                     actuator.delay(properties.postDispenseDwellMs, actuator);
                 }
@@ -265,7 +230,7 @@ public class PasteDispenseProcess {
         }
 
         mainFrame.setStatus(String.format(Locale.US,
-                "Paste dispensing complete. Dispensed %d pad(s).", dispensedPads));
+                "Paste dispensing complete. Dispensed %d dot(s).", dispensedDots));
     }
 
     private Actuator requireDispenseActuator() throws Exception {
@@ -276,9 +241,9 @@ public class PasteDispenseProcess {
         if (actuator.getHead() == null) {
             throw new Exception("The selected paste actuator must be mounted on a head.");
         }
-        if (actuator.getValueType() != ActuatorValueType.Profile) {
+        if (actuator.getValueType() != ActuatorValueType.Boolean) {
             throw new Exception(
-                    "The selected paste actuator must use Profile values so pad sizes can map to G-code profiles.");
+                    "The selected paste actuator must use Boolean values so each dot is one actuation pulse.");
         }
         return actuator;
     }
@@ -322,51 +287,32 @@ public class PasteDispenseProcess {
     private void collectTargets(PlacementsHolderLocation<?> location, List<PastePadTarget> targets)
             throws Exception {
         if (!location.isEnabled()) {
-            Logger.info("LOCATION NOT ENABLED");
             return;
         }
-        
+
         if (location instanceof BoardLocation) {
-            Logger.info("BOARDLOCATION");
             BoardLocation boardLocation = (BoardLocation) location;
-            Logger.info("NUM pads "+String.format("%d", boardLocation.getBoard().getSolderPastePads().size()));
             for (BoardPad pad : boardLocation.getBoard().getSolderPastePads()) {
                 if (pad == null || pad.getPad() == null || pad.getType() != BoardPad.Type.Paste) {
-                    Logger.info("pad null or not paste "+ String.format("%b", pad == null || pad.getPad() == null));
                     continue;
                 }
                 if (pad.getSide() != boardLocation.getGlobalSide()) {
-                    Logger.info("pad on wrong side");
                     continue;
                 }
                 double areaMm2 = calculatePadAreaMm2(pad);
-                String profile = chooseProfile(areaMm2);
-                Location padLocation = calculatePadLocation(boardLocation, pad);
-                Logger.info("PAD at " + String.format("%f %f",padLocation.getX(),padLocation.getY()));
-
-                targets.add(new PastePadTarget(boardLocation, pad, padLocation, areaMm2, profile));
+                List<Location> dotLocations = calculatePadLocations(boardLocation, pad);
+                for (int i = 0; i < dotLocations.size(); i++) {
+                    targets.add(new PastePadTarget(boardLocation, pad, dotLocations.get(i), areaMm2,
+                            i + 1, dotLocations.size()));
+                }
             }
         }
         else if (location instanceof PanelLocation) {
-            Logger.info("PANELLOCATION");
-
             for (PlacementsHolderLocation<?> child : ((PanelLocation) location).getPanel()
                     .getChildren()) {
                 collectTargets(child, targets);
             }
         }
-    }
-
-    private Location calculatePadLocation(BoardLocation boardLocation, BoardPad pad) {
-        Placement placement = new Placement(
-                pad.getName() == null || pad.getName().isEmpty() ? "Paste Pad" : pad.getName());
-        placement.removePropertyChangeListener(placement);
-        placement.setLocation(pad.getLocation());
-        Location location = org.openpnp.util.Utils2D.calculateBoardPlacementLocation(boardLocation,
-                placement);
-        double zOffset = Length.convertToUnits(properties.dispenseZOffsetMm, LengthUnit.Millimeters,
-                location.getUnits());
-        return location.add(new Location(location.getUnits(), 0, 0, zOffset, 0));
     }
 
     private double calculatePadAreaMm2(BoardPad pad) {
@@ -387,27 +333,53 @@ public class PasteDispenseProcess {
         return bounds.getWidth() * bounds.getHeight();
     }
 
-    private String chooseProfile(double areaMm2) throws Exception {
-        String profile;
-        if (areaMm2 <= properties.smallMaxAreaMm2) {
-            profile = firstNonBlank(properties.smallProfile, properties.mediumProfile,
-                    properties.largeProfile, properties.extraLargeProfile);
-        }
-        else if (areaMm2 <= properties.mediumMaxAreaMm2) {
-            profile = firstNonBlank(properties.mediumProfile, properties.largeProfile,
-                    properties.extraLargeProfile);
-        }
-        else if (areaMm2 <= properties.largeMaxAreaMm2) {
-            profile = firstNonBlank(properties.largeProfile, properties.extraLargeProfile);
-        }
-        else {
-            profile = firstNonBlank(properties.extraLargeProfile, properties.largeProfile);
+    private List<Location> calculatePadLocations(BoardLocation boardLocation, BoardPad pad)
+            throws Exception {
+        Pad mmPad = pad.getPad().convertToUnits(LengthUnit.Millimeters);
+        Shape shape = mmPad.getShape();
+        Rectangle2D bounds = shape.getBounds2D();
+        double spacingMm = Math.sqrt(properties.dotAreaMm2);
+        int columns = Math.max(1, (int) Math.ceil(bounds.getWidth() / spacingMm));
+        int rows = Math.max(1, (int) Math.ceil(bounds.getHeight() / spacingMm));
+
+        List<Location> locations = new ArrayList<>();
+        for (int row = 0; row < rows; row++) {
+            double localY =
+                    rows == 1 ? 0.0 : bounds.getMinY() + ((row + 0.5) * bounds.getHeight() / rows);
+            for (int column = 0; column < columns; column++) {
+                double localX = columns == 1 ? 0.0
+                        : bounds.getMinX() + ((column + 0.5) * bounds.getWidth() / columns);
+                if (!shape.contains(localX, localY)) {
+                    continue;
+                }
+                locations.add(calculatePadLocation(boardLocation, pad, localX, localY));
+            }
         }
 
-        if (profile == null || profile.isEmpty()) {
-            throw new Exception("Paste profile mapping is incomplete. Configure at least one profile.");
+        if (locations.isEmpty()) {
+            locations.add(calculatePadLocation(boardLocation, pad, 0.0, 0.0));
         }
-        return profile;
+        return locations;
+    }
+
+    private Location calculatePadLocation(BoardLocation boardLocation, BoardPad pad, double localX,
+            double localY) {
+        Location padLocation = pad.getLocation().convertToUnits(LengthUnit.Millimeters);
+        Location localOffset = new Location(LengthUnit.Millimeters, localX, localY, 0, 0)
+                .rotateXy(padLocation.getRotation());
+        Location pointLocation = padLocation.add(localOffset).derive(null, null, padLocation.getZ(),
+                padLocation.getRotation());
+
+        Placement placement = new Placement(
+                pad.getName() == null || pad.getName().isEmpty() ? "Paste Pad" : pad.getName());
+        placement.removePropertyChangeListener(placement);
+        placement.setLocation(pointLocation);
+
+        Location location = org.openpnp.util.Utils2D.calculateBoardPlacementLocation(boardLocation,
+                placement);
+        double zOffset = Length.convertToUnits(properties.dispenseZOffsetMm, LengthUnit.Millimeters,
+                location.getUnits());
+        return location.add(new Location(location.getUnits(), 0, 0, zOffset, 0));
     }
 
     private void optimizeTravel(Actuator actuator, List<PastePadTarget> targets) {
@@ -453,41 +425,6 @@ public class PasteDispenseProcess {
         for (Actuator actuator : machine.getAllActuators()) {
             if (Objects.equals(actuator.getId(), actuatorId)) {
                 return actuator;
-            }
-        }
-        return null;
-    }
-
-    private JComboBox<String> createEditableProfileBox() {
-        JComboBox<String> comboBox = new JComboBox<>();
-        comboBox.setEditable(true);
-        return comboBox;
-    }
-
-    private void updateProfileChoices(JComboBox<String> comboBox, Actuator actuator,
-            String selectedValue) {
-        comboBox.removeAllItems();
-        comboBox.addItem("");
-        if (actuator != null) {
-            for (String value : actuator.getProfileValues()) {
-                comboBox.addItem(value);
-            }
-        }
-        comboBox.setSelectedItem(selectedValue == null ? "" : selectedValue);
-    }
-
-    private String getComboValue(JComboBox<String> comboBox) {
-        Object item = comboBox.getEditor().getItem();
-        if (item == null) {
-            item = comboBox.getSelectedItem();
-        }
-        return item == null ? "" : item.toString().trim();
-    }
-
-    private String firstNonBlank(String... values) {
-        for (String value : values) {
-            if (value != null && !value.trim().isEmpty()) {
-                return value.trim();
             }
         }
         return null;

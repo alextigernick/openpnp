@@ -54,7 +54,9 @@ public class PasteDispenseProcess {
     public static class PasteDispenseProcessProperties {
         public String actuatorId = "";
         public boolean runFiducialCheck = true;
+        public boolean dryRun = false;
         public double dispenseZOffsetMm = 0.0;
+        public double intraPadLiftMm = 5.0;
         public int postDispenseDwellMs = 0;
         public double dotAreaMm2 = 0.5;
     }
@@ -62,19 +64,17 @@ public class PasteDispenseProcess {
     private static class PastePadTarget {
         private final BoardLocation boardLocation;
         private final BoardPad pad;
-        private final Location location;
+        private final Location travelLocation;
+        private final List<Location> dotLocations;
         private final double areaMm2;
-        private final int dotNumber;
-        private final int dotCount;
 
-        private PastePadTarget(BoardLocation boardLocation, BoardPad pad, Location location,
-                double areaMm2, int dotNumber, int dotCount) {
+        private PastePadTarget(BoardLocation boardLocation, BoardPad pad, Location travelLocation,
+                List<Location> dotLocations, double areaMm2) {
             this.boardLocation = boardLocation;
             this.pad = pad;
-            this.location = location;
+            this.travelLocation = travelLocation;
+            this.dotLocations = dotLocations;
             this.areaMm2 = areaMm2;
-            this.dotNumber = dotNumber;
-            this.dotCount = dotCount;
         }
 
         private String getDisplayName() {
@@ -82,6 +82,34 @@ public class PasteDispenseProcess {
                 return pad.getName();
             }
             return boardLocation.getUniqueId();
+        }
+    }
+
+    private static class LocalDot {
+        private final double x;
+        private final double y;
+
+        private LocalDot(double x, double y) {
+            this.x = x;
+            this.y = y;
+        }
+
+        private double distanceSquared(LocalDot other) {
+            double dx = x - other.x;
+            double dy = y - other.y;
+            return (dx * dx) + (dy * dy);
+        }
+    }
+
+    private static class HexLayout {
+        private final double pitch;
+        private final List<LocalDot> dots;
+        private final double centroidDistanceSquared;
+
+        private HexLayout(double pitch, List<LocalDot> dots, double centroidDistanceSquared) {
+            this.pitch = pitch;
+            this.dots = dots;
+            this.centroidDistanceSquared = centroidDistanceSquared;
         }
     }
 
@@ -136,8 +164,13 @@ public class PasteDispenseProcess {
         JCheckBox fiducialCheckBox = new JCheckBox();
         fiducialCheckBox.setSelected(properties.runFiducialCheck);
 
+        JCheckBox dryRunCheckBox = new JCheckBox();
+        dryRunCheckBox.setSelected(properties.dryRun);
+
         JTextField zOffsetField = new JTextField(
                 String.format(Locale.US, "%.3f", properties.dispenseZOffsetMm), 10);
+        JTextField intraPadLiftField = new JTextField(
+                String.format(Locale.US, "%.3f", properties.intraPadLiftMm), 10);
         JTextField dwellField =
                 new JTextField(Integer.toString(properties.postDispenseDwellMs), 10);
         JTextField dotAreaField =
@@ -147,7 +180,9 @@ public class PasteDispenseProcess {
         int row = 0;
         addField(panel, row++, "Actuator", actuatorBox);
         addField(panel, row++, "Run fiducial check first", fiducialCheckBox);
+        addField(panel, row++, "Dry run (move only, no actuation)", dryRunCheckBox);
         addField(panel, row++, "Dispense Z offset (mm)", zOffsetField);
+        addField(panel, row++, "Raise between dots on one pad (mm)", intraPadLiftField);
         addField(panel, row++, "Post-dispense dwell (ms)", dwellField);
         addField(panel, row++, "Dot area per actuation (mm^2)", dotAreaField);
 
@@ -164,7 +199,13 @@ public class PasteDispenseProcess {
 
         properties.actuatorId = chosenActuator.getId();
         properties.runFiducialCheck = fiducialCheckBox.isSelected();
+        properties.dryRun = dryRunCheckBox.isSelected();
         properties.dispenseZOffsetMm = parseDouble(zOffsetField.getText(), "dispense Z offset");
+        properties.intraPadLiftMm =
+                parseDouble(intraPadLiftField.getText(), "raise between dots on one pad");
+        if (properties.intraPadLiftMm < 0) {
+            throw new Exception("Raise between dots on one pad must be zero or greater.");
+        }
         properties.postDispenseDwellMs = parseInt(dwellField.getText(), "post-dispense dwell");
         if (properties.postDispenseDwellMs < 0) {
             throw new Exception("Post-dispense dwell must be zero or greater.");
@@ -204,21 +245,7 @@ public class PasteDispenseProcess {
 
             optimizeTravel(actuator, targets);
             for (PastePadTarget target : targets) {
-                dispensedDots++;
-                mainFrame.setStatus(String.format(Locale.US,
-                        "Dispensing paste %d: %s on %s dot %d/%d (%.3f mm^2 pad)", dispensedDots,
-                        target.getDisplayName(), target.boardLocation.getUniqueId(),
-                        target.dotNumber, target.dotCount, target.areaMm2));
-                MovableUtils.moveToLocationAtSafeZ(actuator, target.location);
-                Logger.info(String.format(Locale.US,
-                        "Dispensing paste %d: %s on %s dot %d/%d (%.3f mm^2 pad)", dispensedDots,
-                        target.getDisplayName(), target.boardLocation.getUniqueId(),
-                        target.dotNumber, target.dotCount, target.areaMm2));
-                actuator.actuate(true);
-                actuator.actuate(false);
-                if (properties.postDispenseDwellMs > 0) {
-                    actuator.delay(properties.postDispenseDwellMs, actuator);
-                }
+                dispensedDots = dispensePad(actuator, target, dispensedDots);
             }
         }
 
@@ -230,7 +257,10 @@ public class PasteDispenseProcess {
         }
 
         mainFrame.setStatus(String.format(Locale.US,
-                "Paste dispensing complete. Dispensed %d dot(s).", dispensedDots));
+                "Paste %s complete. %s %d dot(s).",
+                properties.dryRun ? "dry run" : "dispensing",
+                properties.dryRun ? "Visited" : "Dispensed",
+                dispensedDots));
     }
 
     private Actuator requireDispenseActuator() throws Exception {
@@ -301,10 +331,9 @@ public class PasteDispenseProcess {
                 }
                 double areaMm2 = calculatePadAreaMm2(pad);
                 List<Location> dotLocations = calculatePadLocations(boardLocation, pad);
-                for (int i = 0; i < dotLocations.size(); i++) {
-                    targets.add(new PastePadTarget(boardLocation, pad, dotLocations.get(i), areaMm2,
-                            i + 1, dotLocations.size()));
-                }
+                targets.add(new PastePadTarget(boardLocation, pad,
+                        calculatePadLocation(boardLocation, pad, 0.0, 0.0), dotLocations,
+                        areaMm2));
             }
         }
         else if (location instanceof PanelLocation) {
@@ -338,28 +367,316 @@ public class PasteDispenseProcess {
         Pad mmPad = pad.getPad().convertToUnits(LengthUnit.Millimeters);
         Shape shape = mmPad.getShape();
         Rectangle2D bounds = shape.getBounds2D();
-        double spacingMm = Math.sqrt(properties.dotAreaMm2);
-        int columns = Math.max(1, (int) Math.ceil(bounds.getWidth() / spacingMm));
-        int rows = Math.max(1, (int) Math.ceil(bounds.getHeight() / spacingMm));
+        double areaMm2 = calculatePadAreaMm2(pad);
+        int targetDotCount = Math.max(1, (int) Math.round(areaMm2 / properties.dotAreaMm2));
+        List<LocalDot> localDots = calculateLocalDots(shape, bounds, areaMm2, targetDotCount);
 
         List<Location> locations = new ArrayList<>();
-        for (int row = 0; row < rows; row++) {
-            double localY =
-                    rows == 1 ? 0.0 : bounds.getMinY() + ((row + 0.5) * bounds.getHeight() / rows);
-            for (int column = 0; column < columns; column++) {
-                double localX = columns == 1 ? 0.0
-                        : bounds.getMinX() + ((column + 0.5) * bounds.getWidth() / columns);
-                if (!shape.contains(localX, localY)) {
-                    continue;
-                }
-                locations.add(calculatePadLocation(boardLocation, pad, localX, localY));
-            }
+        for (LocalDot localDot : localDots) {
+            locations.add(calculatePadLocation(boardLocation, pad, localDot.x, localDot.y));
         }
 
         if (locations.isEmpty()) {
             locations.add(calculatePadLocation(boardLocation, pad, 0.0, 0.0));
         }
         return locations;
+    }
+
+    private List<LocalDot> calculateLocalDots(Shape shape, Rectangle2D bounds, double areaMm2,
+            int targetDotCount) {
+        LocalDot centerDot = calculateCenterDot(shape, bounds);
+        if (targetDotCount <= 1) {
+            List<LocalDot> dots = new ArrayList<>();
+            dots.add(centerDot);
+            return dots;
+        }
+
+        double nominalPitch =
+                Math.sqrt((2.0 * areaMm2) / (Math.sqrt(3.0) * Math.max(1, targetDotCount)));
+        HexLayout layout = findBestHexLayout(shape, bounds, centerDot, targetDotCount, nominalPitch);
+        if (layout == null || layout.dots.isEmpty()) {
+            List<LocalDot> dots = new ArrayList<>();
+            dots.add(centerDot);
+            return dots;
+        }
+
+        List<LocalDot> dots = new ArrayList<>(layout.dots);
+        if (dots.size() > targetDotCount) {
+            dots = selectEvenlySpacedSubset(dots, targetDotCount, centerDot);
+        }
+        if (dots.isEmpty()) {
+            dots.add(centerDot);
+        }
+        return orderDotsByNearestNeighbor(dots, centerDot);
+    }
+
+    private HexLayout findBestHexLayout(Shape shape, Rectangle2D bounds, LocalDot centerDot,
+            int targetDotCount, double nominalPitch) {
+        HexLayout bestLayout = null;
+        HexLayout denseLayout = null;
+        HexLayout sparseLayout = null;
+
+        double densePitch = nominalPitch;
+        HexLayout candidate = generateBestOffsetHexLayout(shape, bounds, centerDot, densePitch,
+                targetDotCount);
+        bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
+        if (candidate != null && candidate.dots.size() >= targetDotCount) {
+            denseLayout = candidate;
+        }
+        else {
+            sparseLayout = candidate;
+        }
+
+        if (denseLayout == null) {
+            double pitch = nominalPitch;
+            for (int i = 0; i < 18; i++) {
+                pitch *= 0.85;
+                candidate = generateBestOffsetHexLayout(shape, bounds, centerDot, pitch,
+                        targetDotCount);
+                bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
+                if (candidate != null && candidate.dots.size() >= targetDotCount) {
+                    denseLayout = candidate;
+                    densePitch = pitch;
+                    break;
+                }
+            }
+        }
+        else {
+            densePitch = denseLayout.pitch;
+        }
+
+        if (sparseLayout == null) {
+            double pitch = nominalPitch;
+            for (int i = 0; i < 18; i++) {
+                pitch /= 0.85;
+                candidate = generateBestOffsetHexLayout(shape, bounds, centerDot, pitch,
+                        targetDotCount);
+                bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
+                if (candidate != null && candidate.dots.size() <= targetDotCount) {
+                    sparseLayout = candidate;
+                    break;
+                }
+            }
+        }
+
+        if (denseLayout != null && sparseLayout != null) {
+            double lowPitch = denseLayout.pitch;
+            double highPitch = sparseLayout.pitch;
+            for (int i = 0; i < 18; i++) {
+                double midPitch = (lowPitch + highPitch) / 2.0;
+                candidate = generateBestOffsetHexLayout(shape, bounds, centerDot, midPitch,
+                        targetDotCount);
+                bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
+                if (candidate == null) {
+                    break;
+                }
+                if (candidate.dots.size() >= targetDotCount) {
+                    denseLayout = candidate;
+                    lowPitch = midPitch;
+                }
+                else {
+                    sparseLayout = candidate;
+                    highPitch = midPitch;
+                }
+            }
+        }
+
+        if (bestLayout != null && bestLayout.dots.size() == targetDotCount) {
+            return bestLayout;
+        }
+        if (denseLayout != null) {
+            return denseLayout;
+        }
+        return bestLayout;
+    }
+
+    private HexLayout generateBestOffsetHexLayout(Shape shape, Rectangle2D bounds, LocalDot centerDot,
+            double pitch, int targetDotCount) {
+        if (!(pitch > 0.0)) {
+            return null;
+        }
+
+        HexLayout bestLayout = null;
+        int phaseSteps = 7;
+        for (int offsetYIndex = 0; offsetYIndex < phaseSteps; offsetYIndex++) {
+            double offsetY = (((double) offsetYIndex / (phaseSteps - 1)) - 0.5)
+                    * (Math.sqrt(3.0) * pitch);
+            for (int offsetXIndex = 0; offsetXIndex < phaseSteps; offsetXIndex++) {
+                double offsetX = (((double) offsetXIndex / (phaseSteps - 1)) - 0.5) * pitch;
+                List<LocalDot> dots = generateHexDots(shape, bounds, centerDot, pitch, offsetX,
+                        offsetY);
+                HexLayout candidate = new HexLayout(pitch, dots,
+                        calculateCentroidDistanceSquared(dots, centerDot));
+                bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
+            }
+        }
+        return bestLayout;
+    }
+
+    private List<LocalDot> generateHexDots(Shape shape, Rectangle2D bounds, LocalDot centerDot,
+            double pitch, double offsetX, double offsetY) {
+        double rowPitch = pitch * Math.sqrt(3.0) / 2.0;
+        List<LocalDot> dots = new ArrayList<>();
+        int rowStart = (int) Math.floor((bounds.getMinY() - centerDot.y - offsetY) / rowPitch) - 2;
+        int rowEnd = (int) Math.ceil((bounds.getMaxY() - centerDot.y - offsetY) / rowPitch) + 2;
+        for (int row = rowStart; row <= rowEnd; row++) {
+            double y = centerDot.y + offsetY + (row * rowPitch);
+            if (y < bounds.getMinY() - rowPitch || y > bounds.getMaxY() + rowPitch) {
+                continue;
+            }
+            double rowOffsetX = ((row & 1) == 0) ? 0.0 : (pitch / 2.0);
+            int columnStart = (int) Math
+                    .floor((bounds.getMinX() - centerDot.x - offsetX - rowOffsetX) / pitch) - 2;
+            int columnEnd = (int) Math
+                    .ceil((bounds.getMaxX() - centerDot.x - offsetX - rowOffsetX) / pitch) + 2;
+            for (int column = columnStart; column <= columnEnd; column++) {
+                double x = centerDot.x + offsetX + rowOffsetX + (column * pitch);
+                if (x < bounds.getMinX() - pitch || x > bounds.getMaxX() + pitch) {
+                    continue;
+                }
+                if (shape.contains(x, y)) {
+                    dots.add(new LocalDot(x, y));
+                }
+            }
+        }
+        return dots;
+    }
+
+    private HexLayout chooseBetterLayout(HexLayout currentBest, HexLayout candidate,
+            int targetDotCount) {
+        if (candidate == null) {
+            return currentBest;
+        }
+        if (currentBest == null) {
+            return candidate;
+        }
+
+        int currentDifference = Math.abs(currentBest.dots.size() - targetDotCount);
+        int candidateDifference = Math.abs(candidate.dots.size() - targetDotCount);
+        if (candidateDifference < currentDifference) {
+            return candidate;
+        }
+        if (candidateDifference > currentDifference) {
+            return currentBest;
+        }
+
+        boolean candidateMeetsTarget = candidate.dots.size() >= targetDotCount;
+        boolean currentMeetsTarget = currentBest.dots.size() >= targetDotCount;
+        if (candidateMeetsTarget && !currentMeetsTarget) {
+            return candidate;
+        }
+        if (!candidateMeetsTarget && currentMeetsTarget) {
+            return currentBest;
+        }
+        if (candidate.centroidDistanceSquared < currentBest.centroidDistanceSquared) {
+            return candidate;
+        }
+        if (candidate.centroidDistanceSquared > currentBest.centroidDistanceSquared) {
+            return currentBest;
+        }
+        return candidate.dots.size() < currentBest.dots.size() ? candidate : currentBest;
+    }
+
+    private double calculateCentroidDistanceSquared(List<LocalDot> dots, LocalDot centerDot) {
+        if (dots.isEmpty()) {
+            return Double.POSITIVE_INFINITY;
+        }
+
+        double sumX = 0.0;
+        double sumY = 0.0;
+        for (LocalDot dot : dots) {
+            sumX += dot.x;
+            sumY += dot.y;
+        }
+        LocalDot centroid = new LocalDot(sumX / dots.size(), sumY / dots.size());
+        return centroid.distanceSquared(centerDot);
+    }
+
+    private List<LocalDot> selectEvenlySpacedSubset(List<LocalDot> candidates, int targetDotCount,
+            LocalDot centerDot) {
+        if (candidates.size() <= targetDotCount) {
+            return new ArrayList<>(candidates);
+        }
+
+        List<LocalDot> remaining = new ArrayList<>(candidates);
+        List<LocalDot> selected = new ArrayList<>();
+        LocalDot firstDot = findNearestDot(remaining, centerDot);
+        selected.add(firstDot);
+        remaining.remove(firstDot);
+
+        while (selected.size() < targetDotCount && !remaining.isEmpty()) {
+            LocalDot bestCandidate = null;
+            double bestDistance = -1.0;
+            for (LocalDot candidate : remaining) {
+                double minDistance = Double.POSITIVE_INFINITY;
+                for (LocalDot selectedDot : selected) {
+                    minDistance = Math.min(minDistance, candidate.distanceSquared(selectedDot));
+                }
+                if (minDistance > bestDistance) {
+                    bestDistance = minDistance;
+                    bestCandidate = candidate;
+                }
+            }
+            selected.add(bestCandidate);
+            remaining.remove(bestCandidate);
+        }
+
+        return selected;
+    }
+
+    private List<LocalDot> orderDotsByNearestNeighbor(List<LocalDot> dots, LocalDot startDot) {
+        if (dots.size() < 2) {
+            return dots;
+        }
+
+        List<LocalDot> remaining = new ArrayList<>(dots);
+        List<LocalDot> ordered = new ArrayList<>();
+        LocalDot current = findNearestDot(remaining, startDot);
+        ordered.add(current);
+        remaining.remove(current);
+
+        while (!remaining.isEmpty()) {
+            LocalDot next = findNearestDot(remaining, current);
+            ordered.add(next);
+            remaining.remove(next);
+            current = next;
+        }
+        return ordered;
+    }
+
+    private LocalDot findNearestDot(List<LocalDot> dots, LocalDot reference) {
+        LocalDot nearest = null;
+        double bestDistance = Double.POSITIVE_INFINITY;
+        for (LocalDot dot : dots) {
+            double distance = dot.distanceSquared(reference);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                nearest = dot;
+            }
+        }
+        return nearest;
+    }
+
+    private LocalDot calculateCenterDot(Shape shape, Rectangle2D bounds) {
+        double centerX = bounds.getCenterX();
+        double centerY = bounds.getCenterY();
+        if (shape.contains(centerX, centerY)) {
+            return new LocalDot(centerX, centerY);
+        }
+
+        double maxRadius = Math.max(bounds.getWidth(), bounds.getHeight());
+        for (int ring = 1; ring <= 20; ring++) {
+            double radius = (maxRadius * ring) / 40.0;
+            for (int step = 0; step < 24; step++) {
+                double angle = (2.0 * Math.PI * step) / 24.0;
+                double x = centerX + (Math.cos(angle) * radius);
+                double y = centerY + (Math.sin(angle) * radius);
+                if (shape.contains(x, y)) {
+                    return new LocalDot(x, y);
+                }
+            }
+        }
+        return new LocalDot(centerX, centerY);
     }
 
     private Location calculatePadLocation(BoardLocation boardLocation, BoardPad pad, double localX,
@@ -382,12 +699,65 @@ public class PasteDispenseProcess {
         return location.add(new Location(location.getUnits(), 0, 0, zOffset, 0));
     }
 
+    private int dispensePad(Actuator actuator, PastePadTarget target, int dispensedDots)
+            throws Exception {
+        for (int i = 0; i < target.dotLocations.size(); i++) {
+            Location dotLocation = target.dotLocations.get(i);
+            if (i == 0) {
+                MovableUtils.moveToLocationAtSafeZ(actuator, dotLocation);
+            }
+            else {
+                moveWithinPad(actuator, dotLocation);
+            }
+
+            int currentDotNumber = i + 1;
+            int totalDispensedDots = dispensedDots + currentDotNumber;
+            mainFrame.setStatus(String.format(Locale.US,
+                    "%s paste %d: %s on %s dot %d/%d (%.3f mm^2 pad)",
+                    properties.dryRun ? "Dry run" : "Dispensing",
+                    totalDispensedDots,
+                    target.getDisplayName(), target.boardLocation.getUniqueId(),
+                    currentDotNumber, target.dotLocations.size(), target.areaMm2));
+            Logger.info(String.format(Locale.US,
+                    "%s paste %d: %s on %s dot %d/%d (%.3f mm^2 pad)",
+                    properties.dryRun ? "Dry run" : "Dispensing",
+                    totalDispensedDots,
+                    target.getDisplayName(), target.boardLocation.getUniqueId(),
+                    currentDotNumber, target.dotLocations.size(), target.areaMm2));
+            if (!properties.dryRun) {
+                actuator.actuate(true);
+                actuator.actuate(false);
+            }
+            if (properties.postDispenseDwellMs > 0) {
+                actuator.delay(properties.postDispenseDwellMs, actuator);
+            }
+        }
+
+        return dispensedDots + target.dotLocations.size();
+    }
+
+    private void moveWithinPad(Actuator actuator, Location targetLocation) throws Exception {
+        if (properties.intraPadLiftMm <= 0) {
+            actuator.moveTo(targetLocation);
+            return;
+        }
+
+        Location currentLocation = actuator.getLocation().convertToUnits(targetLocation.getUnits());
+        double lift = Length.convertToUnits(properties.intraPadLiftMm, LengthUnit.Millimeters,
+                targetLocation.getUnits());
+        double clearanceZ = targetLocation.getZ() + lift;
+
+        actuator.moveTo(currentLocation.derive(null, null, clearanceZ, targetLocation.getRotation()));
+        actuator.moveTo(targetLocation.derive(null, null, clearanceZ, null));
+        actuator.moveTo(targetLocation);
+    }
+
     private void optimizeTravel(Actuator actuator, List<PastePadTarget> targets) {
         if (targets.size() < 2) {
             return;
         }
         TravellingSalesman<PastePadTarget> travellingSalesman = new TravellingSalesman<>(targets,
-                target -> target.location, actuator.getLocation(), null, actuator);
+                target -> target.travelLocation, actuator.getLocation(), null, actuator);
         travellingSalesman.solve();
         List<PastePadTarget> orderedTargets = travellingSalesman.getTravel();
         targets.clear();

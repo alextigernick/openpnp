@@ -24,14 +24,17 @@ import javax.swing.JTextField;
 
 import org.openpnp.gui.JobPanel;
 import org.openpnp.gui.MainFrame;
+import org.openpnp.model.Abstract2DLocatable.Side;
 import org.openpnp.model.BoardLocation;
 import org.openpnp.model.BoardPad;
 import org.openpnp.model.Configuration;
+import org.openpnp.model.Footprint;
 import org.openpnp.model.Length;
 import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
 import org.openpnp.model.Pad;
 import org.openpnp.model.PanelLocation;
+import org.openpnp.model.Part;
 import org.openpnp.model.Placement;
 import org.openpnp.model.PlacementsHolderLocation;
 import org.openpnp.spi.Actuator;
@@ -253,7 +256,7 @@ public class PasteDispenseProcess {
         jobPanel.refresh();
 
         if (!foundAnyPads) {
-            throw new Exception("No solder paste pads were found on the selected board or panel.");
+            throw new Exception("No paste pads were found. Ensure placements are enabled and their packages have footprints defined.");
         }
 
         mainFrame.setStatus(String.format(Locale.US,
@@ -322,18 +325,35 @@ public class PasteDispenseProcess {
 
         if (location instanceof BoardLocation) {
             BoardLocation boardLocation = (BoardLocation) location;
-            for (BoardPad pad : boardLocation.getBoard().getSolderPastePads()) {
-                if (pad == null || pad.getPad() == null || pad.getType() != BoardPad.Type.Paste) {
+            for (Placement placement : boardLocation.getBoard().getPlacements()) {
+                if (!placement.isEnabled()) {
                     continue;
                 }
-                if (pad.getSide() != boardLocation.getGlobalSide()) {
+                if (placement.getType() != Placement.Type.Placement) {
                     continue;
                 }
-                double areaMm2 = calculatePadAreaMm2(pad);
-                List<Location> dotLocations = calculatePadLocations(boardLocation, pad);
-                targets.add(new PastePadTarget(boardLocation, pad,
-                        calculatePadLocation(boardLocation, pad, 0.0, 0.0), dotLocations,
-                        areaMm2));
+                if (placement.getSide() != boardLocation.getGlobalSide()) {
+                    continue;
+                }
+                Part part = placement.getPart();
+                if (part == null || part.getPackage() == null) {
+                    continue;
+                }
+                Footprint footprint = part.getPackage().getFootprint();
+                if (footprint == null || footprint.getPads().isEmpty()) {
+                    continue;
+                }
+                for (Footprint.Pad fp : footprint.getPads()) {
+                    if (fp.getMark()) {
+                        continue;
+                    }
+                    BoardPad boardPad = footprintPadToBoardPad(placement, footprint, fp);
+                    double areaMm2 = calculatePadAreaMm2(boardPad);
+                    List<Location> dotLocations = calculatePadLocations(boardLocation, boardPad);
+                    targets.add(new PastePadTarget(boardLocation, boardPad,
+                            calculatePadLocation(boardLocation, boardPad, 0.0, 0.0), dotLocations,
+                            areaMm2));
+                }
             }
         }
         else if (location instanceof PanelLocation) {
@@ -342,6 +362,59 @@ public class PasteDispenseProcess {
                 collectTargets(child, targets);
             }
         }
+    }
+
+    private BoardPad footprintPadToBoardPad(Placement placement, Footprint footprint,
+            Footprint.Pad fp) {
+        double scale = Length.convertToUnits(1.0, footprint.getUnits(), LengthUnit.Millimeters);
+        double fpXmm = fp.getX() * scale;
+        double fpYmm = fp.getY() * scale;
+        double fpWidthMm = fp.getWidth() * scale;
+        double fpHeightMm = fp.getHeight() * scale;
+
+        // Footprint pads are defined as seen from the component side. For bottom-side components
+        // the component side is the mirror of the board-local (top-view) coordinate space, so
+        // the X offset must be negated to get board-local coordinates.
+        boolean isBottom = placement.getSide() == Side.Bottom;
+        if (isBottom) {
+            fpXmm = -fpXmm;
+        }
+
+        Location placementLoc = placement.getLocation().convertToUnits(LengthUnit.Millimeters);
+        double theta = Math.toRadians(placementLoc.getRotation());
+        double padX = placementLoc.getX() + fpXmm * Math.cos(theta) - fpYmm * Math.sin(theta);
+        double padY = placementLoc.getY() + fpXmm * Math.sin(theta) + fpYmm * Math.cos(theta);
+        double padRot = placementLoc.getRotation() + (isBottom ? -fp.getRotation() : fp.getRotation());
+        Location padLocation = new Location(LengthUnit.Millimeters, padX, padY,
+                placementLoc.getZ(), padRot);
+
+        Pad padShape;
+        if (fp.getRoundness() >= 100.0 && Math.abs(fpWidthMm - fpHeightMm) < 1e-6) {
+            Pad.Circle circle = new Pad.Circle();
+            circle.setUnits(LengthUnit.Millimeters);
+            circle.setRadius(fpWidthMm / 2.0);
+            padShape = circle;
+        }
+        else {
+            Pad.RoundRectangle rr = new Pad.RoundRectangle();
+            rr.setUnits(LengthUnit.Millimeters);
+            rr.setWidth(fpWidthMm);
+            rr.setHeight(fpHeightMm);
+            // Pad.RoundRectangle arc = width * roundness. We want arc = min(w,h) * fp_roundness/100.
+            if (fpWidthMm > 0) {
+                rr.setRoundness(Math.min(fpWidthMm, fpHeightMm) / fpWidthMm * fp.getRoundness() / 100.0);
+            }
+            padShape = rr;
+        }
+
+        String name = placement.getId();
+        if (fp.getName() != null && !fp.getName().isEmpty()) {
+            name += "." + fp.getName();
+        }
+        BoardPad boardPad = new BoardPad(padShape, padLocation);
+        boardPad.setName(name);
+        boardPad.setSide(placement.getSide());
+        return boardPad;
     }
 
     private double calculatePadAreaMm2(BoardPad pad) {

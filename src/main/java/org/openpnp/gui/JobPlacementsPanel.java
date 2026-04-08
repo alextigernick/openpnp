@@ -67,6 +67,7 @@ import org.openpnp.events.DefinitionStructureChangedEvent;
 import org.openpnp.Translations;
 import org.openpnp.events.PlacementSelectedEvent;
 import org.openpnp.gui.components.AutoSelectTextTable;
+import org.openpnp.gui.processes.PasteDispenseProcess;
 import org.openpnp.gui.support.ActionGroup;
 import org.openpnp.gui.support.CustomBooleanRenderer;
 import org.openpnp.gui.support.MonospacedFontTableCellRenderer;
@@ -148,12 +149,12 @@ public class JobPlacementsPanel extends JPanel {
         editFeederActionGroup = new ActionGroup(editPlacementFeederAction);
         editFeederActionGroup.setEnabled(false);
         
-        singleSelectionActionGroup = new ActionGroup(setPlacedAction, setErrorHandlingAction, 
-                setEnabledAction);
+        singleSelectionActionGroup = new ActionGroup(setPlacedAction, setErrorHandlingAction,
+                setEnabledAction, pasteDispenseComponentAction);
         singleSelectionActionGroup.setEnabled(false);
 
-        multiSelectionActionGroup = new ActionGroup(setPlacedAction, setErrorHandlingAction, 
-                setEnabledAction);
+        multiSelectionActionGroup = new ActionGroup(setPlacedAction, setErrorHandlingAction,
+                setEnabledAction, pasteDispenseComponentAction);
         multiSelectionActionGroup.setEnabled(false);
 
         positionActionGroup = new ActionGroup(moveCameraToPlacementLocation,
@@ -382,6 +383,12 @@ public class JobPlacementsPanel extends JPanel {
         btnEditFeeder.setHideActionText(true);
         toolBarPlacements.add(btnEditFeeder);
 
+        toolBarPlacements.addSeparator();
+
+        JButton btnPasteDispenseComponent = new JButton(pasteDispenseComponentAction);
+        btnPasteDispenseComponent.setHideActionText(true);
+        toolBarPlacements.add(btnPasteDispenseComponent);
+
         JPanel panel_1 = new JPanel();
         panel.add(panel_1, BorderLayout.EAST);
 
@@ -518,6 +525,10 @@ public class JobPlacementsPanel extends JPanel {
             return null;
         }
         return selectedPlacements.get(0);
+    }
+
+    public PlacementsHolderLocation<?> getBoardOrPanelLocation() {
+        return boardOrPanelLocation;
     }
 
     public List<Placement> getSelections() {
@@ -758,6 +769,30 @@ public class JobPlacementsPanel extends JPanel {
         public void actionPerformed(ActionEvent arg0) {
             Placement placement = getSelection();
             MainFrame.get().getFeedersTab().showFeederForPart(placement.getPart());
+        }
+    };
+
+    public final Action pasteDispenseComponentAction = new AbstractAction() {
+        {
+            putValue(SMALL_ICON, Icons.paste);
+            putValue(NAME, "Dispense Paste for Selected Components");
+            putValue(SHORT_DESCRIPTION,
+                    "Dispense solder paste only on the pads of the selected component(s).");
+        }
+
+        @Override
+        public void actionPerformed(ActionEvent arg0) {
+            UiUtils.messageBoxOnException(() -> {
+                List<Placement> selections = getSelections();
+                if (selections.isEmpty()) {
+                    throw new Exception("Select at least one component in the placements table.");
+                }
+                List<String> ids = new ArrayList<>();
+                for (Placement placement : selections) {
+                    ids.add(placement.getId());
+                }
+                new PasteDispenseProcess(MainFrame.get(), jobPanel, ids);
+            });
         }
     };
 

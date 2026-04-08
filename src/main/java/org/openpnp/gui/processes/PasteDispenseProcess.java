@@ -4,7 +4,15 @@ import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.awt.Shape;
+import java.awt.geom.AffineTransform;
+import java.awt.geom.PathIterator;
 import java.awt.geom.Rectangle2D;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
@@ -44,6 +52,7 @@ import org.openpnp.spi.Machine;
 import org.openpnp.util.MovableUtils;
 import org.openpnp.util.TravellingSalesman;
 import org.openpnp.util.UiUtils;
+import org.openpnp.util.Utils2D;
 import org.pmw.tinylog.Logger;
 
 public class PasteDispenseProcess {
@@ -53,6 +62,8 @@ public class PasteDispenseProcess {
     private final JobPanel jobPanel;
     private final Machine machine;
     private final PasteDispenseProcessProperties properties;
+    private final Set<String> placementIdFilter;
+    private Path debugOutputDirectory;
 
     public static class PasteDispenseProcessProperties {
         public String actuatorId = "";
@@ -62,6 +73,7 @@ public class PasteDispenseProcess {
         public double intraPadLiftMm = 5.0;
         public int postDispenseDwellMs = 0;
         public double dotAreaMm2 = 0.5;
+        public boolean writeDebugPlots = false;
     }
 
     private static class PastePadTarget {
@@ -88,9 +100,9 @@ public class PasteDispenseProcess {
         }
     }
 
-    private static class LocalDot {
-        private final double x;
-        private final double y;
+    static class LocalDot {
+        final double x;
+        final double y;
 
         private LocalDot(double x, double y) {
             this.x = x;
@@ -107,19 +119,25 @@ public class PasteDispenseProcess {
     private static class HexLayout {
         private final double pitch;
         private final List<LocalDot> dots;
-        private final double centroidDistanceSquared;
+        private final int centerLineDots;
 
-        private HexLayout(double pitch, List<LocalDot> dots, double centroidDistanceSquared) {
+        private HexLayout(double pitch, List<LocalDot> dots, int centerLineDots) {
             this.pitch = pitch;
             this.dots = dots;
-            this.centroidDistanceSquared = centroidDistanceSquared;
+            this.centerLineDots = centerLineDots;
         }
     }
 
     public PasteDispenseProcess(MainFrame mainFrame, JobPanel jobPanel) throws Exception {
+        this(mainFrame, jobPanel, null);
+    }
+
+    public PasteDispenseProcess(MainFrame mainFrame, JobPanel jobPanel,
+            List<String> placementIds) throws Exception {
         this.mainFrame = mainFrame;
         this.jobPanel = jobPanel;
         this.machine = Configuration.get().getMachine();
+        this.placementIdFilter = placementIds == null ? null : new LinkedHashSet<>(placementIds);
         PasteDispenseProcessProperties savedProperties =
                 (PasteDispenseProcessProperties) machine.getProperty(PROPERTY_NAME);
         if (savedProperties == null) {
@@ -178,6 +196,8 @@ public class PasteDispenseProcess {
                 new JTextField(Integer.toString(properties.postDispenseDwellMs), 10);
         JTextField dotAreaField =
                 new JTextField(String.format(Locale.US, "%.3f", properties.dotAreaMm2), 10);
+        JCheckBox debugPlotsCheckBox = new JCheckBox();
+        debugPlotsCheckBox.setSelected(properties.writeDebugPlots);
 
         JPanel panel = new JPanel(new GridBagLayout());
         int row = 0;
@@ -188,6 +208,7 @@ public class PasteDispenseProcess {
         addField(panel, row++, "Raise between dots on one pad (mm)", intraPadLiftField);
         addField(panel, row++, "Post-dispense dwell (ms)", dwellField);
         addField(panel, row++, "Dot area per actuation (mm^2)", dotAreaField);
+        addField(panel, row++, "Write debug pad plots", debugPlotsCheckBox);
 
         int result = JOptionPane.showConfirmDialog(mainFrame, panel, "Paste Dispense",
                 JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
@@ -217,16 +238,29 @@ public class PasteDispenseProcess {
         if (properties.dotAreaMm2 <= 0) {
             throw new Exception("Dot area per actuation must be greater than zero.");
         }
+        properties.writeDebugPlots = debugPlotsCheckBox.isSelected();
         machine.setProperty(PROPERTY_NAME, properties);
         return true;
     }
 
     private void run() throws Exception {
+        debugOutputDirectory = properties.writeDebugPlots ? prepareDebugOutputDirectory() : null;
         Actuator actuator = requireDispenseActuator();
-        List<PlacementsHolderLocation<?>> selectedLocations =
-                pruneNestedSelections(jobPanel.getSelections());
-        if (selectedLocations.isEmpty()) {
-            throw new Exception("Select at least one board or panel in the Job tab.");
+        List<PlacementsHolderLocation<?>> selectedLocations;
+        if (placementIdFilter != null) {
+            PlacementsHolderLocation<?> boardOrPanelLocation =
+                    jobPanel.getJobPlacementsPanel().getBoardOrPanelLocation();
+            if (boardOrPanelLocation == null) {
+                throw new Exception("No board is selected in the placements panel.");
+            }
+            selectedLocations = new ArrayList<>();
+            selectedLocations.add(boardOrPanelLocation);
+        }
+        else {
+            selectedLocations = pruneNestedSelections(jobPanel.getSelections());
+            if (selectedLocations.isEmpty()) {
+                throw new Exception("Select at least one board or panel in the Job tab.");
+            }
         }
 
         int dispensedDots = 0;
@@ -264,6 +298,9 @@ public class PasteDispenseProcess {
                 properties.dryRun ? "dry run" : "dispensing",
                 properties.dryRun ? "Visited" : "Dispensed",
                 dispensedDots));
+        if (debugOutputDirectory != null) {
+            Logger.info("Paste debug plots written to {}", debugOutputDirectory.toAbsolutePath());
+        }
     }
 
     private Actuator requireDispenseActuator() throws Exception {
@@ -335,6 +372,9 @@ public class PasteDispenseProcess {
                 if (placement.getSide() != boardLocation.getGlobalSide()) {
                     continue;
                 }
+                if (placementIdFilter != null && !placementIdFilter.contains(placement.getId())) {
+                    continue;
+                }
                 Part part = placement.getPart();
                 if (part == null || part.getPackage() == null) {
                     continue;
@@ -344,9 +384,6 @@ public class PasteDispenseProcess {
                     continue;
                 }
                 for (Footprint.Pad fp : footprint.getPads()) {
-                    if (fp.getMark()) {
-                        continue;
-                    }
                     BoardPad boardPad = footprintPadToBoardPad(placement, footprint, fp);
                     double areaMm2 = calculatePadAreaMm2(boardPad);
                     List<Location> dotLocations = calculatePadLocations(boardLocation, boardPad);
@@ -366,11 +403,24 @@ public class PasteDispenseProcess {
 
     private BoardPad footprintPadToBoardPad(Placement placement, Footprint footprint,
             Footprint.Pad fp) {
+        Location padLocation = createPlacementLocalPadLocation(placement, footprint, fp);
+        Pad padShape = createPadShape(footprint, fp);
+
+        String name = placement.getId();
+        if (fp.getName() != null && !fp.getName().isEmpty()) {
+            name += "." + fp.getName();
+        }
+        BoardPad boardPad = new BoardPad(padShape, padLocation);
+        boardPad.setName(name);
+        boardPad.setSide(placement.getSide());
+        return boardPad;
+    }
+
+    static Location createPlacementLocalPadLocation(Placement placement, Footprint footprint,
+            Footprint.Pad fp) {
         double scale = Length.convertToUnits(1.0, footprint.getUnits(), LengthUnit.Millimeters);
         double fpXmm = fp.getX() * scale;
         double fpYmm = fp.getY() * scale;
-        double fpWidthMm = fp.getWidth() * scale;
-        double fpHeightMm = fp.getHeight() * scale;
 
         // Footprint pads are defined as seen from the component side. For bottom-side components
         // the component side is the mirror of the board-local (top-view) coordinate space, so
@@ -381,13 +431,15 @@ public class PasteDispenseProcess {
         }
 
         Location placementLoc = placement.getLocation().convertToUnits(LengthUnit.Millimeters);
-        double theta = Math.toRadians(placementLoc.getRotation());
-        double padX = placementLoc.getX() + fpXmm * Math.cos(theta) - fpYmm * Math.sin(theta);
-        double padY = placementLoc.getY() + fpXmm * Math.sin(theta) + fpYmm * Math.cos(theta);
-        double padRot = placementLoc.getRotation() + (isBottom ? -fp.getRotation() : fp.getRotation());
-        Location padLocation = new Location(LengthUnit.Millimeters, padX, padY,
-                placementLoc.getZ(), padRot);
+        Location localPadLocation = new Location(LengthUnit.Millimeters, fpXmm, fpYmm,
+                placementLoc.getZ(), isBottom ? -fp.getRotation() : fp.getRotation());
+        return localPadLocation.rotateXy(-placementLoc.getRotation()).addWithRotation(placementLoc);
+    }
 
+    static Pad createPadShape(Footprint footprint, Footprint.Pad fp) {
+        double scale = Length.convertToUnits(1.0, footprint.getUnits(), LengthUnit.Millimeters);
+        double fpWidthMm = fp.getWidth() * scale;
+        double fpHeightMm = fp.getHeight() * scale;
         Pad padShape;
         if (fp.getRoundness() >= 100.0 && Math.abs(fpWidthMm - fpHeightMm) < 1e-6) {
             Pad.Circle circle = new Pad.Circle();
@@ -406,15 +458,7 @@ public class PasteDispenseProcess {
             }
             padShape = rr;
         }
-
-        String name = placement.getId();
-        if (fp.getName() != null && !fp.getName().isEmpty()) {
-            name += "." + fp.getName();
-        }
-        BoardPad boardPad = new BoardPad(padShape, padLocation);
-        boardPad.setName(name);
-        boardPad.setSide(placement.getSide());
-        return boardPad;
+        return padShape;
     }
 
     private double calculatePadAreaMm2(BoardPad pad) {
@@ -452,10 +496,44 @@ public class PasteDispenseProcess {
         if (locations.isEmpty()) {
             locations.add(calculatePadLocation(boardLocation, pad, 0.0, 0.0));
         }
+        writePadDebugPlot(boardLocation, pad, mmPad, localDots, locations, areaMm2, targetDotCount);
         return locations;
     }
 
-    private List<LocalDot> calculateLocalDots(Shape shape, Rectangle2D bounds, double areaMm2,
+    static List<LocalDot> calculateLocalDots(Pad mmPad, double dotAreaMm2) {
+        Shape shape = mmPad.getShape();
+        Rectangle2D bounds = shape.getBounds2D();
+        double areaMm2 = calculatePadAreaMm2(mmPad);
+        int targetDotCount = Math.max(1, (int) Math.round(areaMm2 / dotAreaMm2));
+        return calculateLocalDots(shape, bounds, areaMm2, targetDotCount);
+    }
+
+    private static double calculatePadAreaMm2(Pad mmPad) {
+        if (mmPad instanceof Pad.Circle) {
+            double radius = ((Pad.Circle) mmPad).getRadius();
+            return Math.PI * radius * radius;
+        }
+        if (mmPad instanceof Pad.Ellipse) {
+            Pad.Ellipse ellipse = (Pad.Ellipse) mmPad;
+            return Math.PI * ellipse.getWidth() * ellipse.getHeight() / 4.0;
+        }
+        if (mmPad instanceof Pad.RoundRectangle) {
+            Pad.RoundRectangle rect = (Pad.RoundRectangle) mmPad;
+            return rect.getWidth() * rect.getHeight();
+        }
+        Rectangle2D bounds = mmPad.getShape().getBounds2D();
+        return bounds.getWidth() * bounds.getHeight();
+    }
+
+    static List<Location> calculateLocalDotLocations(Pad mmPad, double dotAreaMm2) {
+        List<Location> locations = new ArrayList<>();
+        for (LocalDot dot : calculateLocalDots(mmPad, dotAreaMm2)) {
+            locations.add(new Location(LengthUnit.Millimeters, dot.x, dot.y, 0, 0));
+        }
+        return locations;
+    }
+
+    private static List<LocalDot> calculateLocalDots(Shape shape, Rectangle2D bounds, double areaMm2,
             int targetDotCount) {
         LocalDot centerDot = calculateCenterDot(shape, bounds);
         if (targetDotCount <= 1) {
@@ -464,9 +542,10 @@ public class PasteDispenseProcess {
             return dots;
         }
 
+        boolean longAxisX = bounds.getWidth() >= bounds.getHeight();
         double nominalPitch =
                 Math.sqrt((2.0 * areaMm2) / (Math.sqrt(3.0) * Math.max(1, targetDotCount)));
-        HexLayout layout = findBestHexLayout(shape, bounds, centerDot, targetDotCount, nominalPitch);
+        HexLayout layout = findBestHexLayout(shape, targetDotCount, nominalPitch, longAxisX, bounds);
         if (layout == null || layout.dots.isEmpty()) {
             List<LocalDot> dots = new ArrayList<>();
             dots.add(centerDot);
@@ -475,147 +554,86 @@ public class PasteDispenseProcess {
 
         List<LocalDot> dots = new ArrayList<>(layout.dots);
         if (dots.size() > targetDotCount) {
-            dots = selectEvenlySpacedSubset(dots, targetDotCount, centerDot);
+            dots = new ArrayList<>(dots.subList(0, targetDotCount));
         }
         if (dots.isEmpty()) {
             dots.add(centerDot);
         }
-        return orderDotsByNearestNeighbor(dots, centerDot);
+        return dots;
     }
 
-    private HexLayout findBestHexLayout(Shape shape, Rectangle2D bounds, LocalDot centerDot,
-            int targetDotCount, double nominalPitch) {
+    private static HexLayout findBestHexLayout(Shape shape, int targetDotCount, double nominalPitch,
+            boolean longAxisX, Rectangle2D bounds) {
         HexLayout bestLayout = null;
-        HexLayout denseLayout = null;
-        HexLayout sparseLayout = null;
-
-        double densePitch = nominalPitch;
-        HexLayout candidate = generateBestOffsetHexLayout(shape, bounds, centerDot, densePitch,
-                targetDotCount);
-        bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
-        if (candidate != null && candidate.dots.size() >= targetDotCount) {
-            denseLayout = candidate;
-        }
-        else {
-            sparseLayout = candidate;
-        }
-
-        if (denseLayout == null) {
-            double pitch = nominalPitch;
-            for (int i = 0; i < 18; i++) {
-                pitch *= 0.85;
-                candidate = generateBestOffsetHexLayout(shape, bounds, centerDot, pitch,
-                        targetDotCount);
-                bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
-                if (candidate != null && candidate.dots.size() >= targetDotCount) {
-                    denseLayout = candidate;
-                    densePitch = pitch;
-                    break;
-                }
-            }
-        }
-        else {
-            densePitch = denseLayout.pitch;
-        }
-
-        if (sparseLayout == null) {
-            double pitch = nominalPitch;
-            for (int i = 0; i < 18; i++) {
-                pitch /= 0.85;
-                candidate = generateBestOffsetHexLayout(shape, bounds, centerDot, pitch,
-                        targetDotCount);
-                bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
-                if (candidate != null && candidate.dots.size() <= targetDotCount) {
-                    sparseLayout = candidate;
-                    break;
-                }
-            }
-        }
-
-        if (denseLayout != null && sparseLayout != null) {
-            double lowPitch = denseLayout.pitch;
-            double highPitch = sparseLayout.pitch;
-            for (int i = 0; i < 18; i++) {
-                double midPitch = (lowPitch + highPitch) / 2.0;
-                candidate = generateBestOffsetHexLayout(shape, bounds, centerDot, midPitch,
-                        targetDotCount);
-                bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
-                if (candidate == null) {
-                    break;
-                }
-                if (candidate.dots.size() >= targetDotCount) {
-                    denseLayout = candidate;
-                    lowPitch = midPitch;
-                }
-                else {
-                    sparseLayout = candidate;
-                    highPitch = midPitch;
-                }
-            }
-        }
-
-        if (bestLayout != null && bestLayout.dots.size() == targetDotCount) {
-            return bestLayout;
-        }
-        if (denseLayout != null) {
-            return denseLayout;
+        double minPitch = nominalPitch * 0.35;
+        double maxPitch = nominalPitch * 2.50;
+        for (int i = 0; i < 48; i++) {
+            double t = i / 47.0;
+            double pitch = minPitch * Math.pow(maxPitch / minPitch, t);
+            HexLayout candidate = generateAxisHexLayout(shape, bounds, pitch, longAxisX);
+            bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
         }
         return bestLayout;
     }
 
-    private HexLayout generateBestOffsetHexLayout(Shape shape, Rectangle2D bounds, LocalDot centerDot,
-            double pitch, int targetDotCount) {
+    private static HexLayout generateAxisHexLayout(Shape shape, Rectangle2D bounds, double pitch,
+            boolean longAxisX) {
         if (!(pitch > 0.0)) {
             return null;
         }
 
-        HexLayout bestLayout = null;
-        int phaseSteps = 7;
-        for (int offsetYIndex = 0; offsetYIndex < phaseSteps; offsetYIndex++) {
-            double offsetY = (((double) offsetYIndex / (phaseSteps - 1)) - 0.5)
-                    * (Math.sqrt(3.0) * pitch);
-            for (int offsetXIndex = 0; offsetXIndex < phaseSteps; offsetXIndex++) {
-                double offsetX = (((double) offsetXIndex / (phaseSteps - 1)) - 0.5) * pitch;
-                List<LocalDot> dots = generateHexDots(shape, bounds, centerDot, pitch, offsetX,
-                        offsetY);
-                HexLayout candidate = new HexLayout(pitch, dots,
-                        calculateCentroidDistanceSquared(dots, centerDot));
-                bestLayout = chooseBetterLayout(bestLayout, candidate, targetDotCount);
-            }
-        }
-        return bestLayout;
-    }
-
-    private List<LocalDot> generateHexDots(Shape shape, Rectangle2D bounds, LocalDot centerDot,
-            double pitch, double offsetX, double offsetY) {
-        double rowPitch = pitch * Math.sqrt(3.0) / 2.0;
         List<LocalDot> dots = new ArrayList<>();
-        int rowStart = (int) Math.floor((bounds.getMinY() - centerDot.y - offsetY) / rowPitch) - 2;
-        int rowEnd = (int) Math.ceil((bounds.getMaxY() - centerDot.y - offsetY) / rowPitch) + 2;
-        for (int row = rowStart; row <= rowEnd; row++) {
-            double y = centerDot.y + offsetY + (row * rowPitch);
-            if (y < bounds.getMinY() - rowPitch || y > bounds.getMaxY() + rowPitch) {
-                continue;
-            }
-            double rowOffsetX = ((row & 1) == 0) ? 0.0 : (pitch / 2.0);
-            int columnStart = (int) Math
-                    .floor((bounds.getMinX() - centerDot.x - offsetX - rowOffsetX) / pitch) - 2;
-            int columnEnd = (int) Math
-                    .ceil((bounds.getMaxX() - centerDot.x - offsetX - rowOffsetX) / pitch) + 2;
-            for (int column = columnStart; column <= columnEnd; column++) {
-                double x = centerDot.x + offsetX + rowOffsetX + (column * pitch);
-                if (x < bounds.getMinX() - pitch || x > bounds.getMaxX() + pitch) {
-                    continue;
-                }
-                if (shape.contains(x, y)) {
-                    dots.add(new LocalDot(x, y));
-                }
+        int centerLineDots = addAxisLineDots(shape, bounds, longAxisX, 0.0, 0.0, pitch, dots);
+        double rowPitch = pitch * Math.sqrt(3.0) / 2.0;
+        double minorHalfSpan = longAxisX ? bounds.getHeight() / 2.0 : bounds.getWidth() / 2.0;
+        int maxRows = Math.max(1, (int) Math.ceil((minorHalfSpan + rowPitch) / rowPitch));
+        for (int row = 1; row <= maxRows; row++) {
+            double v = row * rowPitch;
+            double phase = ((row & 1) == 1) ? (pitch / 2.0) : 0.0;
+            boolean addedPositive = addAxisLineDots(shape, bounds, longAxisX, v, phase, pitch,
+                    dots) > 0;
+            boolean addedNegative = addAxisLineDots(shape, bounds, longAxisX, -v, phase, pitch,
+                    dots) > 0;
+            if (!addedPositive && !addedNegative && v > minorHalfSpan) {
+                break;
             }
         }
-        return dots;
+        return new HexLayout(pitch, dots, centerLineDots);
     }
 
-    private HexLayout chooseBetterLayout(HexLayout currentBest, HexLayout candidate,
+    private static int addAxisLineDots(Shape shape, Rectangle2D bounds, boolean longAxisX,
+            double minorOffset, double phase, double pitch, List<LocalDot> dots) {
+        double halfMajorSpan = longAxisX ? bounds.getWidth() / 2.0 : bounds.getHeight() / 2.0;
+        int dotsBefore = dots.size();
+
+        if (Math.abs(phase) < 1e-9) {
+            addAxisDot(shape, longAxisX, 0.0, minorOffset, dots);
+        }
+
+        for (int index = 0;; index++) {
+            double majorOffset = phase + (index * pitch);
+            if (majorOffset > halfMajorSpan + pitch) {
+                break;
+            }
+            if (majorOffset > 1e-9) {
+                addAxisDot(shape, longAxisX, majorOffset, minorOffset, dots);
+                addAxisDot(shape, longAxisX, -majorOffset, minorOffset, dots);
+            }
+        }
+
+        return dots.size() - dotsBefore;
+    }
+
+    private static void addAxisDot(Shape shape, boolean longAxisX, double majorOffset,
+            double minorOffset, List<LocalDot> dots) {
+        LocalDot dot = longAxisX ? new LocalDot(majorOffset, minorOffset)
+                : new LocalDot(minorOffset, majorOffset);
+        if (shape.contains(dot.x, dot.y)) {
+            dots.add(dot);
+        }
+    }
+
+    private static HexLayout chooseBetterLayout(HexLayout currentBest, HexLayout candidate,
             int targetDotCount) {
         if (candidate == null) {
             return currentBest;
@@ -641,96 +659,16 @@ public class PasteDispenseProcess {
         if (!candidateMeetsTarget && currentMeetsTarget) {
             return currentBest;
         }
-        if (candidate.centroidDistanceSquared < currentBest.centroidDistanceSquared) {
+        if (candidate.centerLineDots > currentBest.centerLineDots) {
             return candidate;
         }
-        if (candidate.centroidDistanceSquared > currentBest.centroidDistanceSquared) {
+        if (candidate.centerLineDots < currentBest.centerLineDots) {
             return currentBest;
         }
         return candidate.dots.size() < currentBest.dots.size() ? candidate : currentBest;
     }
 
-    private double calculateCentroidDistanceSquared(List<LocalDot> dots, LocalDot centerDot) {
-        if (dots.isEmpty()) {
-            return Double.POSITIVE_INFINITY;
-        }
-
-        double sumX = 0.0;
-        double sumY = 0.0;
-        for (LocalDot dot : dots) {
-            sumX += dot.x;
-            sumY += dot.y;
-        }
-        LocalDot centroid = new LocalDot(sumX / dots.size(), sumY / dots.size());
-        return centroid.distanceSquared(centerDot);
-    }
-
-    private List<LocalDot> selectEvenlySpacedSubset(List<LocalDot> candidates, int targetDotCount,
-            LocalDot centerDot) {
-        if (candidates.size() <= targetDotCount) {
-            return new ArrayList<>(candidates);
-        }
-
-        List<LocalDot> remaining = new ArrayList<>(candidates);
-        List<LocalDot> selected = new ArrayList<>();
-        LocalDot firstDot = findNearestDot(remaining, centerDot);
-        selected.add(firstDot);
-        remaining.remove(firstDot);
-
-        while (selected.size() < targetDotCount && !remaining.isEmpty()) {
-            LocalDot bestCandidate = null;
-            double bestDistance = -1.0;
-            for (LocalDot candidate : remaining) {
-                double minDistance = Double.POSITIVE_INFINITY;
-                for (LocalDot selectedDot : selected) {
-                    minDistance = Math.min(minDistance, candidate.distanceSquared(selectedDot));
-                }
-                if (minDistance > bestDistance) {
-                    bestDistance = minDistance;
-                    bestCandidate = candidate;
-                }
-            }
-            selected.add(bestCandidate);
-            remaining.remove(bestCandidate);
-        }
-
-        return selected;
-    }
-
-    private List<LocalDot> orderDotsByNearestNeighbor(List<LocalDot> dots, LocalDot startDot) {
-        if (dots.size() < 2) {
-            return dots;
-        }
-
-        List<LocalDot> remaining = new ArrayList<>(dots);
-        List<LocalDot> ordered = new ArrayList<>();
-        LocalDot current = findNearestDot(remaining, startDot);
-        ordered.add(current);
-        remaining.remove(current);
-
-        while (!remaining.isEmpty()) {
-            LocalDot next = findNearestDot(remaining, current);
-            ordered.add(next);
-            remaining.remove(next);
-            current = next;
-        }
-        return ordered;
-    }
-
-    private LocalDot findNearestDot(List<LocalDot> dots, LocalDot reference) {
-        LocalDot nearest = null;
-        double bestDistance = Double.POSITIVE_INFINITY;
-        for (LocalDot dot : dots) {
-            double distance = dot.distanceSquared(reference);
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                nearest = dot;
-            }
-        }
-        return nearest;
-    }
-
-    private LocalDot calculateCenterDot(Shape shape, Rectangle2D bounds) {
+    private static LocalDot calculateCenterDot(Shape shape, Rectangle2D bounds) {
         double centerX = bounds.getCenterX();
         double centerY = bounds.getCenterY();
         if (shape.contains(centerX, centerY)) {
@@ -755,10 +693,9 @@ public class PasteDispenseProcess {
     private Location calculatePadLocation(BoardLocation boardLocation, BoardPad pad, double localX,
             double localY) {
         Location padLocation = pad.getLocation().convertToUnits(LengthUnit.Millimeters);
-        Location localOffset = new Location(LengthUnit.Millimeters, localX, localY, 0, 0)
-                .rotateXy(padLocation.getRotation());
-        Location pointLocation = padLocation.add(localOffset).derive(null, null, padLocation.getZ(),
-                padLocation.getRotation());
+        Location pointLocation = new Location(LengthUnit.Millimeters, localX, localY, 0, 0)
+                .offsetWithRotationFrom(padLocation)
+                .derive(null, null, padLocation.getZ(), padLocation.getRotation());
 
         Placement placement = new Placement(
                 pad.getName() == null || pad.getName().isEmpty() ? "Paste Pad" : pad.getName());
@@ -906,5 +843,167 @@ public class PasteDispenseProcess {
         fieldConstraints.fill = GridBagConstraints.HORIZONTAL;
         fieldConstraints.insets = new Insets(4, 0, 4, 4);
         panel.add(component, fieldConstraints);
+    }
+
+    private Path prepareDebugOutputDirectory() throws Exception {
+        try {
+            Path baseDir = Path.of(System.getProperty("java.io.tmpdir"), "openpnp-paste-debug");
+            Files.createDirectories(baseDir);
+            Path runDir = baseDir.resolve(String.format(Locale.US, "run-%d", System.currentTimeMillis()));
+            Files.createDirectories(runDir);
+            Logger.info("Paste debug plots enabled: {}", runDir.toAbsolutePath());
+            return runDir;
+        }
+        catch (IOException e) {
+            throw new Exception("Unable to create paste debug output directory.", e);
+        }
+    }
+
+    private void writePadDebugPlot(BoardLocation boardLocation, BoardPad pad, Pad mmPad,
+            List<LocalDot> localDots, List<Location> boardDots, double areaMm2, int targetDotCount)
+            throws Exception {
+        if (debugOutputDirectory == null) {
+            return;
+        }
+
+        String safeName = sanitizeFileName(String.format(Locale.US, "%s__%s",
+                boardLocation.getUniqueId(), pad.getName() == null ? "pad" : pad.getName()));
+        Path svgPath = debugOutputDirectory.resolve(safeName + ".svg");
+        Path boardSvgPath = debugOutputDirectory.resolve(safeName + "__board.svg");
+        Path csvPath = debugOutputDirectory.resolve(safeName + ".csv");
+
+        Rectangle2D bounds = mmPad.getShape().getBounds2D();
+        double margin = Math.max(0.5, Math.max(bounds.getWidth(), bounds.getHeight()) * 0.15);
+        double minX = bounds.getMinX() - margin;
+        double minY = bounds.getMinY() - margin;
+        double width = bounds.getWidth() + margin * 2.0;
+        double height = bounds.getHeight() + margin * 2.0;
+
+        try (BufferedWriter writer = Files.newBufferedWriter(svgPath, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            writer.write(String.format(Locale.US,
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"%.6f %.6f %.6f %.6f\">%n",
+                    minX, -minY - height, width, height));
+            writer.write("<rect width=\"100%\" height=\"100%\" fill=\"white\"/>");
+            writer.write(String.format(Locale.US,
+                    "<path d=\"%s\" fill=\"none\" stroke=\"#111\" stroke-width=\"0.05\"/>%n",
+                    shapeToSvgPath(mmPad.getShape())));
+            for (int i = 0; i < localDots.size(); i++) {
+                LocalDot dot = localDots.get(i);
+                writer.write(String.format(Locale.US,
+                        "<circle cx=\"%.6f\" cy=\"%.6f\" r=\"0.12\" fill=\"#d7263d\"/>%n",
+                        dot.x, -dot.y));
+                writer.write(String.format(Locale.US,
+                        "<text x=\"%.6f\" y=\"%.6f\" font-size=\"0.35\" fill=\"#1f4e79\">%d</text>%n",
+                        dot.x + 0.15, -dot.y - 0.15, i + 1));
+            }
+            writer.write("</svg>\n");
+        }
+        catch (IOException e) {
+            throw new Exception("Unable to write paste debug SVG: " + svgPath, e);
+        }
+
+        Shape boardShape = transformPadShapeToBoard(boardLocation, pad, mmPad);
+        Rectangle2D boardBounds = boardShape.getBounds2D();
+        double boardMargin = Math.max(0.5,
+                Math.max(boardBounds.getWidth(), boardBounds.getHeight()) * 0.15);
+        double boardMinX = boardBounds.getMinX() - boardMargin;
+        double boardMinY = boardBounds.getMinY() - boardMargin;
+        double boardWidth = boardBounds.getWidth() + boardMargin * 2.0;
+        double boardHeight = boardBounds.getHeight() + boardMargin * 2.0;
+
+        try (BufferedWriter writer = Files.newBufferedWriter(boardSvgPath, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            writer.write(String.format(Locale.US,
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"%.6f %.6f %.6f %.6f\">%n",
+                    boardMinX, -boardMinY - boardHeight, boardWidth, boardHeight));
+            writer.write("<rect width=\"100%\" height=\"100%\" fill=\"white\"/>");
+            writer.write(String.format(Locale.US,
+                    "<path d=\"%s\" fill=\"none\" stroke=\"#111\" stroke-width=\"0.05\"/>%n",
+                    shapeToSvgPath(boardShape)));
+            for (int i = 0; i < boardDots.size(); i++) {
+                Location boardDot = boardDots.get(i).convertToUnits(LengthUnit.Millimeters);
+                writer.write(String.format(Locale.US,
+                        "<circle cx=\"%.6f\" cy=\"%.6f\" r=\"0.12\" fill=\"#1f4e79\"/>%n",
+                        boardDot.getX(), -boardDot.getY()));
+                writer.write(String.format(Locale.US,
+                        "<text x=\"%.6f\" y=\"%.6f\" font-size=\"0.35\" fill=\"#d7263d\">%d</text>%n",
+                        boardDot.getX() + 0.15, -boardDot.getY() - 0.15, i + 1));
+            }
+            writer.write("</svg>\n");
+        }
+        catch (IOException e) {
+            throw new Exception("Unable to write paste debug board SVG: " + boardSvgPath, e);
+        }
+
+        try (BufferedWriter writer = Files.newBufferedWriter(csvPath, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            writer.write("board_id,pad_name,pad_rotation_deg,pad_area_mm2,target_dot_count,dot_index,local_x_mm,local_y_mm,board_x_mm,board_y_mm,board_rotation_deg\n");
+            Location padLocation = pad.getLocation().convertToUnits(LengthUnit.Millimeters);
+            for (int i = 0; i < localDots.size(); i++) {
+                LocalDot localDot = localDots.get(i);
+                Location boardDot = boardDots.get(i).convertToUnits(LengthUnit.Millimeters);
+                writer.write(String.format(Locale.US,
+                        "\"%s\",\"%s\",%.6f,%.6f,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f%n",
+                        boardLocation.getUniqueId(),
+                        pad.getName() == null ? "" : pad.getName(),
+                        padLocation.getRotation(), areaMm2, targetDotCount, i + 1, localDot.x,
+                        localDot.y, boardDot.getX(), boardDot.getY(), boardDot.getRotation()));
+            }
+        }
+        catch (IOException e) {
+            throw new Exception("Unable to write paste debug CSV: " + csvPath, e);
+        }
+    }
+
+    private String sanitizeFileName(String value) {
+        return value.replaceAll("[^A-Za-z0-9._-]", "_");
+    }
+
+    private Shape transformPadShapeToBoard(BoardLocation boardLocation, BoardPad pad, Pad mmPad) {
+        Location padLocation = pad.getLocation().convertToUnits(LengthUnit.Millimeters);
+        AffineTransform padTransform = new AffineTransform();
+        padTransform.translate(padLocation.getX(), padLocation.getY());
+        padTransform.rotate(Math.toRadians(padLocation.getRotation()));
+        Shape boardLocalShape = padTransform.createTransformedShape(mmPad.getShape());
+
+        AffineTransform boardTransform = boardLocation.getLocalToGlobalTransform();
+        if (boardTransform == null) {
+            boardTransform = Utils2D.getDefaultBoardPlacementLocationTransform(boardLocation);
+        }
+        return boardTransform.createTransformedShape(boardLocalShape);
+    }
+
+    private String shapeToSvgPath(Shape shape) {
+        StringBuilder builder = new StringBuilder();
+        PathIterator iterator = shape.getPathIterator(null, 0.02);
+        double[] coords = new double[6];
+        while (!iterator.isDone()) {
+            int type = iterator.currentSegment(coords);
+            switch (type) {
+                case PathIterator.SEG_MOVETO:
+                    builder.append(String.format(Locale.US, "M %.6f %.6f ", coords[0], -coords[1]));
+                    break;
+                case PathIterator.SEG_LINETO:
+                    builder.append(String.format(Locale.US, "L %.6f %.6f ", coords[0], -coords[1]));
+                    break;
+                case PathIterator.SEG_QUADTO:
+                    builder.append(String.format(Locale.US, "Q %.6f %.6f %.6f %.6f ", coords[0],
+                            -coords[1], coords[2], -coords[3]));
+                    break;
+                case PathIterator.SEG_CUBICTO:
+                    builder.append(String.format(Locale.US,
+                            "C %.6f %.6f %.6f %.6f %.6f %.6f ", coords[0], -coords[1], coords[2],
+                            -coords[3], coords[4], -coords[5]));
+                    break;
+                case PathIterator.SEG_CLOSE:
+                    builder.append("Z ");
+                    break;
+                default:
+                    break;
+            }
+            iterator.next();
+        }
+        return builder.toString().trim();
     }
 }

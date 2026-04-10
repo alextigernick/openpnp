@@ -736,11 +736,14 @@ public class PasteDispenseProcess {
                     currentDotNumber, target.dotLocations.size(), target.areaMm2));
             if (!properties.dryRun) {
                 actuator.actuate(true);
-                actuator.actuate(false);
             }
             if (properties.postDispenseDwellMs > 0) {
                 actuator.delay(properties.postDispenseDwellMs, actuator);
             }
+            if (!properties.dryRun) {
+                actuator.actuate(false);
+            }
+
         }
 
         return dispensedDots + target.dotLocations.size();

@@ -19,6 +19,7 @@
 
 package org.openpnp.gui.wizards;
 
+import javax.swing.JCheckBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JTextField;
@@ -41,6 +42,8 @@ public class PartSettingsWizard extends AbstractConfigurationWizard {
     private JPanel pickConditionsPanel;
     private JLabel lblNewLabel;
     private JTextField textFieldPickRetryCount;
+    private JLabel lblSlowMode;
+    private JCheckBox chckbxSlowMode;
 
     public PartSettingsWizard(Part part) {
         super();
@@ -61,23 +64,35 @@ public class PartSettingsWizard extends AbstractConfigurationWizard {
                 ColumnSpec.decode("default:grow"),},
             new RowSpec[] {
                 FormSpecs.RELATED_GAP_ROWSPEC,
+                FormSpecs.DEFAULT_ROWSPEC,
+                FormSpecs.RELATED_GAP_ROWSPEC,
                 FormSpecs.DEFAULT_ROWSPEC,}));
-        
+
         lblNewLabel = new JLabel(Translations.getString(
                 "PartSettingsWizard.pickConditionsPanel.pickRetryCountLabel.text")); //$NON-NLS-1$
         lblNewLabel.setToolTipText(Translations.getString("PartSettingsWizard.pickConditionsPanel.pickRetryCountLabel.toolTipText")); //$NON-NLS-1$
         pickConditionsPanel.add(lblNewLabel, "2, 2, right, default");
-        
+
         textFieldPickRetryCount = new JTextField();
         pickConditionsPanel.add(textFieldPickRetryCount, "4, 2, left, default");
         textFieldPickRetryCount.setColumns(10);
+
+        lblSlowMode = new JLabel(Translations.getString(
+                "PartSettingsWizard.pickConditionsPanel.slowModeLabel.text")); //$NON-NLS-1$
+        lblSlowMode.setToolTipText(Translations.getString(
+                "PartSettingsWizard.pickConditionsPanel.slowModeLabel.toolTipText")); //$NON-NLS-1$
+        pickConditionsPanel.add(lblSlowMode, "2, 4, right, default");
+
+        chckbxSlowMode = new JCheckBox();
+        pickConditionsPanel.add(chckbxSlowMode, "4, 4, left, default");
     }
     
     @Override
     public void createBindings() {
         IntegerConverter intConverter = new IntegerConverter();
-        bind(UpdateStrategy.READ_WRITE, part, "pickRetryCount", textFieldPickRetryCount, "text", intConverter); 
-        
+        bind(UpdateStrategy.READ_WRITE, part, "pickRetryCount", textFieldPickRetryCount, "text", intConverter);
+        bind(UpdateStrategy.READ_WRITE, part, "slowMode", chckbxSlowMode, "selected");
+
         ComponentDecorators.decorateWithAutoSelect(textFieldPickRetryCount);
     }
 }

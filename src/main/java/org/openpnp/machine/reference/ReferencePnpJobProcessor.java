@@ -30,6 +30,13 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.Map;
 
+import java.awt.FlowLayout;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JLabel;
+import javax.swing.JOptionPane;
+import javax.swing.JPanel;
+import javax.swing.JTextField;
 import javax.swing.SwingUtilities;
 
 import org.openpnp.Translations;
@@ -50,6 +57,7 @@ import org.openpnp.model.PanelLocation;
 import org.openpnp.model.Part;
 import org.openpnp.model.Placement;
 import org.openpnp.model.PlacementsHolderLocation;
+import org.openpnp.spi.Camera;
 import org.openpnp.spi.CameraBatchOperation;
 import org.openpnp.spi.Feeder;
 import org.openpnp.spi.Feeder;
@@ -173,6 +181,9 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
 
     private boolean cameraBatchOperationStarted;
 
+    // Tracks feeder IDs that have already triggered a slow-mode pause this job run.
+    protected Set<String> slowModeVisitedFeeders = new HashSet<>();
+
     long startTime;
     int totalPartsPlaced;
     
@@ -184,6 +195,7 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             throw new Exception("Can't initialize with a null Job.");
         }
         this.job = job;
+        slowModeVisitedFeeders = new HashSet<>();
         currentStep = new PreFlight();
         this.fireJobState(Configuration.get().getMachine().getSignalers(), AbstractJobProcessor.State.STOPPED);
     }
@@ -1598,13 +1610,17 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
     }
 
     /**
-     * Alignment step - align all parts on all nozzles
+     * Alignment step - align all parts on all nozzles.
+     * For slow-mode parts (first pick per feeder per job), the nozzle is first positioned over
+     * the bottom camera so the user can visually inspect part orientation. A dialog lets them
+     * adjust the feeder pick rotation; the nozzle is then physically rotated by that delta before
+     * vision runs, so the alignment result reflects the corrected orientation.
      */
     protected class Align extends PlannedPlacementStep {
         public Align(List<PlannedPlacement> plannedPlacements) {
             super(plannedPlacements);
         }
-        
+
         @Override
         public Step stepImpl(PlannedPlacement plannedPlacement) throws JobProcessorException {
             if (plannedPlacement == null) {
@@ -1615,22 +1631,126 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             final JobPlacement jobPlacement = plannedPlacement.jobPlacement;
             final Placement placement = jobPlacement.getPlacement();
             final Part part = placement.getPart();
+            final Feeder feeder = jobPlacement.getPlannedFeeder();
 
             final PartAlignment partAlignment = AbstractPartAlignment.getPartAlignment(part);
-            
+
             if (partAlignment == null) {
                 plannedPlacement.alignmentOffsets = null;
                 Logger.debug("Not aligning {} as no compatible enabled aligners defined", part);
                 return this;
             }
 
+            // Slow mode: on first pick from a feeder this job, position over camera and pause for inspection.
+            if (part.isSlowMode() && feeder != null && !slowModeVisitedFeeders.contains(feeder.getId())) {
+                slowModeVisitedFeeders.add(feeder.getId());
+                slowModeInspect(plannedPlacement, nozzle, feeder, part, partAlignment);
+            }
+
             align(plannedPlacement, partAlignment);
-            
+
             checkPartOn(nozzle);
 
             return this;
         }
-        
+
+        /**
+         * Moves the nozzle to the bottom camera, shows the slow-mode inspection dialog, and
+         * if the user changed the feeder rotation, physically rotates the nozzle by the delta
+         * so that the subsequent vision run sees the corrected part orientation.
+         */
+        private void slowModeInspect(PlannedPlacement plannedPlacement, Nozzle nozzle,
+                Feeder feeder, Part part, PartAlignment partAlignment) throws JobProcessorException {
+            // Position nozzle over the bottom camera so the user can see the part.
+            try {
+                Camera camera = VisionUtils.getBottomVisionCamera();
+                Location cameraLocation = partAlignment instanceof org.openpnp.machine.reference.vision.ReferenceBottomVision
+                        ? ((org.openpnp.machine.reference.vision.ReferenceBottomVision) partAlignment)
+                                .getCameraLocationAtPartHeight(part, camera, nozzle, nozzle.getLocation().getRotation())
+                        : camera.getLocation(nozzle);
+                fireTextStatus("Slow Mode: positioning %s over bottom camera for inspection.", part.getId());
+                MovableUtils.moveToLocationAtSafeZ(nozzle, cameraLocation);
+            }
+            catch (Exception e) {
+                Logger.warn("Slow Mode: could not position over camera: {}", e.getMessage());
+            }
+
+            // Show the dialog on the EDT and wait for the user to dismiss it.
+            double[] rotationDelta = {0.0};
+            try {
+                SwingUtilities.invokeAndWait(() -> showSlowModeDialog(feeder, part, rotationDelta));
+            }
+            catch (Exception e) {
+                Logger.warn("Slow Mode dialog interrupted: {}", e.getMessage());
+            }
+
+            // If the user changed the rotation, update the feeder setting and rotate the nozzle.
+            if (rotationDelta[0] != 0.0 && feeder instanceof ReferenceFeeder) {
+                ReferenceFeeder rf = (ReferenceFeeder) feeder;
+                Location oldLoc = rf.getLocation();
+                rf.setLocation(oldLoc.derive(null, null, null, oldLoc.getRotation() + rotationDelta[0]));
+
+                // Rotate the nozzle in-place by the same delta so vision sees the corrected part.
+                try {
+                    Location currentNozzleLoc = nozzle.getLocation();
+                    nozzle.moveTo(currentNozzleLoc.derive(null, null, null,
+                            currentNozzleLoc.getRotation() + rotationDelta[0]));
+                }
+                catch (Exception e) {
+                    throw new JobProcessorException(nozzle, e);
+                }
+            }
+        }
+
+        private void showSlowModeDialog(Feeder feeder, Part part, double[] rotationDelta) {
+            double currentFeederRotation = (feeder instanceof ReferenceFeeder)
+                    ? ((ReferenceFeeder) feeder).getLocation().getRotation()
+                    : 0.0;
+
+            JPanel panel = new JPanel();
+            panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+
+            JLabel header = new JLabel("<html>"
+                    + "<b>Slow Mode – First Pick Inspection</b><br><br>"
+                    + "Part: <b>" + part.getId() + "</b> &nbsp;&nbsp; Feeder: <b>" + feeder.getName() + "</b><br><br>"
+                    + "Inspect the part orientation in the camera view.<br>"
+                    + "Adjust the feeder pick rotation if the part is misoriented, then click <b>OK</b>."
+                    + "</html>");
+            panel.add(header);
+            panel.add(Box.createVerticalStrut(12));
+
+            JPanel rotRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+            JTextField rotField = null;
+            if (feeder instanceof ReferenceFeeder) {
+                rotRow.add(new JLabel("Pick rotation:"));
+                rotField = new JTextField(String.format("%.2f", currentFeederRotation), 8);
+                rotRow.add(rotField);
+                rotRow.add(new JLabel("°  (change this to rotate the part and re-run vision)"));
+                panel.add(rotRow);
+            }
+            else {
+                panel.add(new JLabel("This feeder type does not support pick rotation adjustment."));
+            }
+
+            final JTextField finalRotField = rotField;
+            int result = JOptionPane.showConfirmDialog(
+                    MainFrame.get(),
+                    panel,
+                    "Slow Mode – Inspect Before Vision",
+                    JOptionPane.OK_CANCEL_OPTION,
+                    JOptionPane.PLAIN_MESSAGE);
+
+            if (result == JOptionPane.OK_OPTION && finalRotField != null) {
+                try {
+                    double newRotation = Double.parseDouble(finalRotField.getText().trim());
+                    rotationDelta[0] = newRotation - currentFeederRotation;
+                }
+                catch (NumberFormatException ignored) {
+                    // leave unchanged
+                }
+            }
+        }
+
         private void align(PlannedPlacement plannedPlacement, PartAlignment partAlignment) throws JobProcessorException {
             final Nozzle nozzle = plannedPlacement.nozzle;
             final JobPlacement jobPlacement = plannedPlacement.jobPlacement;

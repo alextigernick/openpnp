@@ -57,6 +57,9 @@ public class Part extends AbstractPartSettingsHolder {
     @Attribute(required = false)
     private int pickRetryCount = 0;
 
+    @Attribute(required = false)
+    private boolean slowMode = false;
+
     @SuppressWarnings("unused")
     private Part() {
         this(null);
@@ -169,6 +172,16 @@ public class Part extends AbstractPartSettingsHolder {
         Object oldValue = this.pickRetryCount;
         this.pickRetryCount = pickRetryCount;
         firePropertyChange("pickRetryCount", oldValue, pickRetryCount);
+    }
+
+    public boolean isSlowMode() {
+        return slowMode;
+    }
+
+    public void setSlowMode(boolean slowMode) {
+        Object oldValue = this.slowMode;
+        this.slowMode = slowMode;
+        firePropertyChange("slowMode", oldValue, slowMode);
     }
 
     @Override
